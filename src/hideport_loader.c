@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include <errno.h>
@@ -24,6 +25,9 @@ struct config {
     int port_count;
     uint32_t uids[MAX_UIDS];
     int uid_count;
+    int hide_process;
+    uint32_t hide_uids[MAX_UIDS];
+    int hide_uid_count;
 };
 
 static volatile sig_atomic_t exiting;
@@ -148,6 +152,23 @@ static int parse_args(int argc, char **argv, struct config *cfg)
                 return -EINVAL;
             if (add_uid(cfg, value))
                 return -EINVAL;
+            continue;
+        }
+
+        if (!strcmp(arg, "--hide-process")) {
+            cfg->hide_process = 1;
+            continue;
+        }
+
+        if (!strcmp(arg, "--hide-uid")) {
+            if (++i >= argc)
+                return -EINVAL;
+            value_text = argv[i];
+            if (parse_ulong(value_text, UINT32_MAX, &value))
+                return -EINVAL;
+            if (cfg->hide_uid_count >= MAX_UIDS)
+                return -EINVAL;
+            cfg->hide_uids[cfg->hide_uid_count++] = (uint32_t)value;
             continue;
         }
 
@@ -399,6 +420,76 @@ static int attach_bind_probes(struct hideport_bpf *skel,
     return -ENOENT;
 }
 
+static int attach_getdents_pair(struct bpf_program *entry_prog,
+                                struct bpf_program *ret_prog,
+                                const char *symbol,
+                                struct bpf_link **entry_link,
+                                struct bpf_link **ret_link)
+{
+    struct bpf_link *entry = NULL;
+    struct bpf_link *ret = NULL;
+    long err;
+
+    entry = bpf_program__attach_kprobe(entry_prog, false, symbol);
+    err = libbpf_get_error(entry);
+    if (err) {
+        fprintf(stderr, "attach getdents64 entry probe to %s failed: %ld (%s)\n",
+                symbol, err, strerror((int)-err));
+        return (int)err;
+    }
+
+    ret = bpf_program__attach_kprobe(ret_prog, true, symbol);
+    err = libbpf_get_error(ret);
+    if (err) {
+        fprintf(stderr, "attach getdents64 ret probe to %s failed: %ld (%s)\n",
+                symbol, err, strerror((int)-err));
+        bpf_link__destroy(entry);
+        return (int)err;
+    }
+
+    fprintf(stderr, "attached getdents64 probes to %s\n", symbol);
+    *entry_link = entry;
+    *ret_link = ret;
+    return 0;
+}
+
+static int attach_getdents_probes(struct hideport_bpf *skel,
+                                  struct bpf_link **entry_link,
+                                  struct bpf_link **ret_link)
+{
+    static const char *const direct_symbols[] = {
+        "__sys_getdents64",
+        "__se_sys_getdents64",
+        "sys_getdents64",
+        "SyS_getdents64",
+    };
+    static const char *const arm64_symbols[] = {
+        "__arm64_sys_getdents64",
+    };
+
+    for (size_t i = 0; i < sizeof(direct_symbols) / sizeof(direct_symbols[0]); i++) {
+        if (!attach_getdents_pair(skel->progs.hideproc_gd_entry_direct,
+                                  skel->progs.hideproc_gd_ret,
+                                  direct_symbols[i],
+                                  entry_link,
+                                  ret_link)) {
+            return 0;
+        }
+    }
+
+    for (size_t i = 0; i < sizeof(arm64_symbols) / sizeof(arm64_symbols[0]); i++) {
+        if (!attach_getdents_pair(skel->progs.hideproc_gd_entry_arm64,
+                                  skel->progs.hideproc_gd_ret,
+                                  arm64_symbols[i],
+                                  entry_link,
+                                  ret_link)) {
+            return 0;
+        }
+    }
+
+    return -ENOENT;
+}
+
 static struct bpf_link *try_attach_close_symbols(struct bpf_program *prog,
                                                  const char *const *symbols,
                                                  size_t count,
@@ -448,6 +539,83 @@ static struct bpf_link *attach_optional_close_probe(struct hideport_bpf *skel)
                                     "arm64 syscall-wrapper");
 }
 
+static int scan_scene_pids(const struct config *cfg, uint32_t *out, int max)
+{
+    DIR *proc = opendir("/proc");
+    struct dirent *de;
+    int n = 0;
+
+    if (!proc)
+        return 0;
+
+    while ((de = readdir(proc)) != NULL && n < max) {
+        char *end = NULL;
+        unsigned long pid = strtoul(de->d_name, &end, 10);
+
+        if (de->d_name[0] == '\0' || *end != '\0')
+            continue;
+
+        char path[64];
+        snprintf(path, sizeof(path), "/proc/%lu/status", pid);
+
+        FILE *f = fopen(path, "r");
+        if (!f)
+            continue;
+
+        char line[256];
+        uint32_t uid = 0;
+        int found = 0;
+        while (fgets(line, sizeof(line), f)) {
+            if (strncmp(line, "Uid:", 4) == 0) {
+                uid = (uint32_t)strtoul(line + 4, NULL, 10);
+                found = 1;
+                break;
+            }
+        }
+        fclose(f);
+        if (!found)
+            continue;
+
+        for (int i = 0; i < cfg->hide_uid_count; i++) {
+            if (cfg->hide_uids[i] == uid) {
+                out[n++] = (uint32_t)pid;
+                break;
+            }
+        }
+    }
+
+    closedir(proc);
+    return n;
+}
+
+static void refresh_hide_pids(struct hideport_bpf *skel,
+                              const struct config *cfg,
+                              uint32_t *prev,
+                              int *prev_count)
+{
+    uint32_t cur[256];
+    int cur_n = scan_scene_pids(cfg, cur, 256);
+    int fd = bpf_map__fd(skel->maps.hide_pids);
+    __u8 val = 1;
+
+    for (int i = 0; i < *prev_count; i++) {
+        int still = 0;
+        for (int j = 0; j < cur_n; j++) {
+            if (cur[j] == prev[i]) {
+                still = 1;
+                break;
+            }
+        }
+        if (!still)
+            bpf_map_delete_elem(fd, &prev[i]);
+    }
+    for (int i = 0; i < cur_n; i++)
+        bpf_map_update_elem(fd, &cur[i], &val, BPF_ANY);
+
+    *prev_count = cur_n;
+    memcpy(prev, cur, (size_t)cur_n * sizeof(uint32_t));
+}
+
 int main(int argc, char **argv)
 {
     struct config cfg;
@@ -457,6 +625,10 @@ int main(int argc, char **argv)
     struct bpf_link *getsockname_entry_link = NULL;
     struct bpf_link *getsockname_ret_link = NULL;
     struct bpf_link *close_link = NULL;
+    struct bpf_link *gd_entry_link = NULL;
+    struct bpf_link *gd_ret_link = NULL;
+    uint32_t prev_pids[256];
+    int prev_count = 0;
     int cgroup_fd = -1;
     int connect4_attached = 0;
     int connect6_attached = 0;
@@ -501,6 +673,28 @@ int main(int argc, char **argv)
     err = setup_uids(skel, &cfg);
     if (err)
         goto cleanup;
+
+    if (cfg.hide_process) {
+        __u8 one = 1;
+        __u8 zero = 0;
+        __u32 z = 0;
+
+        if (bpf_map_update_elem(bpf_map__fd(skel->maps.hide_process_cfg),
+                                &z, &one, BPF_ANY)) {
+            fprintf(stderr, "failed to enable process hiding: %s\n",
+                    strerror(errno));
+        } else if (attach_getdents_probes(skel, &gd_entry_link, &gd_ret_link)) {
+            fprintf(stderr, "warning: getdents64 probes unavailable; process hiding disabled\n");
+            bpf_map_update_elem(bpf_map__fd(skel->maps.hide_process_cfg),
+                                &z, &zero, BPF_ANY);
+            gd_entry_link = NULL;
+            gd_ret_link = NULL;
+        } else {
+            fprintf(stderr, "process hiding enabled for %d uids\n",
+                    cfg.hide_uid_count);
+            refresh_hide_pids(skel, &cfg, prev_pids, &prev_count);
+        }
+    }
 
     cgroup_fd = open(CGROUP_PATH, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (cgroup_fd < 0) {
@@ -570,8 +764,12 @@ int main(int argc, char **argv)
     }
 
     fprintf(stderr, "hideport cgroup-connect loaded\n");
-    while (!exiting)
+    int tick = 0;
+    while (!exiting) {
+        if (cfg.hide_process && gd_entry_link && (++tick % 2 == 0))
+            refresh_hide_pids(skel, &cfg, prev_pids, &prev_count);
         sleep(1);
+    }
 
     err = 0;
 
@@ -597,6 +795,8 @@ cleanup:
                                    BPF_CGROUP_INET4_CONNECT,
                                    "connect4");
     bpf_link__destroy(close_link);
+    bpf_link__destroy(gd_ret_link);
+    bpf_link__destroy(gd_entry_link);
     bpf_link__destroy(bind_ret_link);
     bpf_link__destroy(bind_entry_link);
     bpf_link__destroy(getsockname_ret_link);

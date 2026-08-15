@@ -1,6 +1,6 @@
 id=hideSceneport
 name=Scene Port Hider by eBPF
-version=v2.0.3
-versionCode=5
+version=v2.1.0
+versionCode=6
 author=Andrea-Lyz
-description=Hide Scene loopback connect probes for configured ports with an eBPF cgroup module
+description=Hide Scene loopback connect probes and (optionally) Scene processes from /proc via an eBPF cgroup module. Set HIDE_PROCESS=1 in hideport.conf to also hide processes.

@@ -13,6 +13,7 @@ ENABLE_EBPF=1
 WAIT_FOR_PROCESS=0
 EXTRA_ALLOWED_UIDS=""
 WAIT_FOR_UID_TIMEOUT=300
+HIDE_PROCESS=0
 
 [ -f "$CONF" ] && . "$CONF"
 START_CONTEXT="${1:-manual}"
@@ -171,6 +172,13 @@ done
 for uid in $APP_UIDS; do
     ARGS="$ARGS --uid $uid"
 done
+
+if [ "$HIDE_PROCESS" = "1" ]; then
+    ARGS="$ARGS --hide-process"
+    for uid in $APP_UIDS; do
+        ARGS="$ARGS --hide-uid $uid"
+    done
+fi
 
 log_msg "$START_CONTEXT" "starting hideport_loader for package $PKG uids $APP_UIDS ports $PORTS"
 "$LOADER" $ARGS >> "$LOG" 2>&1 &

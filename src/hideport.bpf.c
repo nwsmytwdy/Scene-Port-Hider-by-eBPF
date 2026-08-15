@@ -509,3 +509,174 @@ int hideport_close_entry_arm64(struct pt_regs *ctx)
 
     return forget_fd((__s32)BPF_CORE_READ(syscall_regs, regs[0]));
 }
+
+/* =========================================================================
+ * Process hiding: filter Scene PIDs out of getdents64() results.
+ *
+ * Anti-cheat engines enumerate /proc to discover running processes. This
+ * kretprobe rewrites the returned directory buffer so that any entry whose
+ * name is a PID present in hide_pids is dropped. Only Scene's own PIDs are
+ * ever in hide_pids, so the blast radius is limited to those specific dirs.
+ *
+ * The rewrite only happens for readers whose UID is NOT in allowed_uids
+ * (root / system / Scene itself still see the truth), and only when
+ * hide_process_cfg[0] == 1, which the loader sets solely when HIDE_PROCESS=1.
+ * Default-off keeps the original port-hiding behaviour untouched.
+ * ========================================================================= */
+
+#ifndef PROC_HIDE_BUFSZ
+#define PROC_HIDE_BUFSZ 8192
+#endif
+
+struct linux_dirent64 {
+    __u64 d_ino;
+    __u64 d_off;
+    unsigned short d_reclen;
+    unsigned char d_type;
+    char d_name[];
+};
+
+struct getdents_ctx {
+    __u64 dirp;
+    __s32 fd;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct getdents_ctx);
+} gd_ctx SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __uint(key_size, 4);
+    __uint(value_size, PROC_HIDE_BUFSZ);
+} gd_buf SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, __u32);
+    __type(value, __u8);
+} hide_pids SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u8);
+} hide_process_cfg SEC(".maps");
+
+static __always_inline int gd_name_is_pid(const char *name, __u32 *out_pid)
+{
+    __u32 pid = 0;
+    int i;
+
+    for (i = 0; i < 10; i++) {
+        char c = name[i];
+
+        if (c == '\0')
+            break;
+        if (c < '0' || c > '9')
+            return 0;
+        pid = pid * 10 + (c - '0');
+    }
+    if (i == 0)
+        return 0;
+    *out_pid = pid;
+    return 1;
+}
+
+static __always_inline void gd_record(__s32 fd, __u64 dirp)
+{
+    __u32 key = 0;
+    struct getdents_ctx *ctx = bpf_map_lookup_elem(&gd_ctx, &key);
+
+    if (!ctx)
+        return;
+    ctx->fd = fd;
+    ctx->dirp = dirp;
+}
+
+SEC("kprobe/__sys_getdents64")
+int hideproc_gd_entry_direct(struct pt_regs *ctx)
+{
+    return gd_record((__s32)PT_REGS_PARM1(ctx), (__u64)PT_REGS_PARM2(ctx));
+}
+
+SEC("kprobe/__arm64_sys_getdents64")
+int hideproc_gd_entry_arm64(struct pt_regs *ctx)
+{
+    const struct pt_regs *syscall_regs = (const struct pt_regs *)PT_REGS_PARM1(ctx);
+
+    return gd_record((__s32)BPF_CORE_READ(syscall_regs, regs[0]),
+                     (__u64)BPF_CORE_READ(syscall_regs, regs[1]));
+}
+
+SEC("kretprobe/__sys_getdents64")
+int hideproc_gd_ret(struct pt_regs *ctx)
+{
+    __u32 key = 0;
+    __u8 *enabled = bpf_map_lookup_elem(&hide_process_cfg, &key);
+
+    if (!enabled || *enabled == 0)
+        return 0;
+
+    /* Trusted readers (root / system / Scene UID) always see the truth. */
+    __u32 uid = (__u32)bpf_get_current_uid_gid();
+    if (bpf_map_lookup_elem(&allowed_uids, &uid))
+        return 0;
+
+    struct getdents_ctx *gctx = bpf_map_lookup_elem(&gd_ctx, &key);
+    if (!gctx || gctx->dirp == 0)
+        return 0;
+
+    long len = PT_REGS_RC(ctx);
+    if (len <= 0 || len > PROC_HIDE_BUFSZ)
+        return 0;
+
+    __u8 *buf = bpf_map_lookup_elem(&gd_buf, &key);
+    if (!buf)
+        return 0;
+    if (bpf_probe_read_user(buf, len, (void *)gctx->dirp))
+        return 0;
+
+    unsigned long off = 0;
+    unsigned long new_off = 0;
+    __u8 removed = 0;
+
+    for (int i = 0; i < 1024 && off < (__u64)len; i++) {
+        unsigned short reclen = 0;
+        char name[32] = {};
+
+        if (off + sizeof(struct linux_dirent64) > (__u64)len)
+            break;
+        if (bpf_probe_read_kernel(&reclen, sizeof(reclen), buf + off + 16))
+            break;
+        if (reclen < sizeof(struct linux_dirent64) ||
+            off + reclen > (__u64)len)
+            break;
+        if (bpf_probe_read_kernel(&name, sizeof(name), buf + off + 19))
+            break;
+
+        __u32 pid = 0;
+        if (gd_name_is_pid(name, &pid) &&
+            bpf_map_lookup_elem(&hide_pids, &pid)) {
+            removed = 1;
+        } else {
+            __builtin_memcpy(buf + new_off, buf + off, reclen);
+            new_off += reclen;
+        }
+        off += reclen;
+    }
+
+    if (!removed)
+        return 0;
+    if (bpf_probe_write_user((void *)gctx->dirp, buf, new_off))
+        return 0;
+
+    PT_REGS_RC(ctx) = new_off;
+    return 0;
+}
